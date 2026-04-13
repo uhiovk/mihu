@@ -423,7 +423,7 @@ fn init_app(mihomo_path: Option<PathBuf>, extctl_url: Option<String>) -> Result<
             config.mihomo_path = absolute(path)?;
         }
         if let Some(url) = extctl_url {
-            config.external_control_url = format!("{}/configs", url.trim_end_matches('/'));
+            config.external_control_url = format!("{}/", url.trim_end_matches('/'));
         }
         config.save()?;
     }
