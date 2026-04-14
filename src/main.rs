@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::fs::{File, create_dir, create_dir_all, read_to_string, remove_file, write};
 use std::path::{PathBuf, absolute};
+use std::sync::LazyLock;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use clap::{Parser, Subcommand};
@@ -10,6 +11,8 @@ use serde::{Deserialize, Serialize};
 use serde_yml::{Mapping, Value};
 use url::Url;
 use which::which;
+
+static CLIENT: LazyLock<Client> = LazyLock::new(Client::new);
 
 #[derive(Serialize, Deserialize)]
 struct MihuConfig {
@@ -47,30 +50,30 @@ impl MihuConfig {
             None
         };
 
-        let Some(config) = sub_config.as_mapping_mut() else {
+        let Some(sub_config) = sub_config.as_mapping_mut() else {
             bail!("subscription config is malformed");
         };
         let Some(global_override) = global_override.as_mapping() else {
             bail!("global override is malformed");
         };
 
-        merge(config, global_override);
+        merge(sub_config, global_override);
 
         if let Some(sub_override) = sub_override {
             let Some(sub_override) = sub_override.as_mapping() else {
                 bail!("subscription override is malformed");
             };
-            merge(config, sub_override);
+            merge(sub_config, sub_override);
         }
 
-        serde_yml::to_writer(File::create(&self.mihomo_path)?, &sub_config)?;
+        serde_yml::to_writer(File::create(&self.mihomo_path)?, sub_config)?;
 
         let endpoint = format!("{}/configs", self.external_control_url.trim_end_matches('/'));
-        reqwest::blocking::Client::new()
+        CLIENT
             .put(endpoint)
             .body(r#"{"path": "", "payload": ""}"#)
             .send()
-            .map_err(|_| anyhow!("cannot reload config"))?;
+            .map_err(|_| anyhow!("cannot reload mihomo config"))?;
 
         Ok(())
     }
@@ -141,8 +144,8 @@ fn get_sub_path(name: &str, get_override: bool) -> PathBuf {
     dirs::config_dir().unwrap().join("mihu").join(subfolder).join(name).with_added_extension("yaml")
 }
 
-fn subscribe(url: &str, client: &Client) -> Result<String> {
-    let response = client.get(url).header("user-agent", "clash.meta").send()?;
+fn fetch_sub_config(url: &str) -> Result<String> {
+    let response = CLIENT.get(url).header("user-agent", "clash.meta").send()?;
     ensure!(response.status().is_success(), "cannot fetch subscription: {}", response.status());
     let content = response.text()?;
     ensure!(serde_yml::from_str::<Value>(&content)?.is_mapping(), "fetched config is malformed");
@@ -215,13 +218,13 @@ pub enum Command {
     /// Print information about current configuration
     Info {
         /// Print detailed information
-        #[arg(short, long, conflicts_with_all = ["raw", "mihomo"])]
+        #[arg(short, long, exclusive = true)]
         verbose: bool,
         /// Print raw configuration in YAML
-        #[arg(short, long, conflicts_with = "mihomo")]
+        #[arg(short, long, exclusive = true)]
         raw: bool,
         /// Print current mihomo configuration
-        #[arg(short, long)]
+        #[arg(short, long, exclusive = true)]
         mihomo: bool,
     },
     /// Initialize the software
@@ -239,7 +242,7 @@ fn add_sub(name: String, url: String, switch: bool, set_default: bool) -> Result
     ensure!(Url::parse(&url).is_ok(), "invalid URL");
     let mut config = MihuConfig::load()?;
     let sub_path = get_sub_path(&name, false);
-    write(&sub_path, subscribe(&url, &Client::new())?)?;
+    write(&sub_path, fetch_sub_config(&url)?)?;
     if switch {
         config.current_sub = name.clone();
         config.reload_mihomo(&name)?;
@@ -252,9 +255,9 @@ fn add_sub(name: String, url: String, switch: bool, set_default: bool) -> Result
     Ok(())
 }
 
-fn remove_sub(name: &str, remove_override: bool) -> Result<()> {
+fn remove_sub(name: String, remove_override: bool) -> Result<()> {
     let mut config = MihuConfig::load()?;
-    config.subs.remove(name);
+    config.subs.remove(&name);
 
     let mut need_reload = false;
     let fallback = config.subs.keys().next().cloned().unwrap_or_default();
@@ -267,18 +270,18 @@ fn remove_sub(name: &str, remove_override: bool) -> Result<()> {
     }
 
     config.save()?;
-    let sub_path = get_sub_path(name, false);
+    let sub_path = get_sub_path(&name, false);
     if sub_path.exists() {
         remove_file(sub_path)?;
     }
     if remove_override {
-        let ovrd_path = get_sub_path(name, true);
+        let ovrd_path = get_sub_path(&name, true);
         if ovrd_path.exists() {
             remove_file(ovrd_path)?;
         }
     }
 
-    if !config.current_sub.is_empty() && need_reload {
+    if need_reload && !config.current_sub.is_empty() {
         config.reload_mihomo(&config.current_sub)?;
     }
     Ok(())
@@ -294,7 +297,7 @@ fn switch_sub(name: Option<String>, update: bool, set_default: bool) -> Result<(
     let sub_path = get_sub_path(&name, false);
     if update {
         let url = &config.subs[&name];
-        write(&sub_path, subscribe(url, &Client::new())?)?;
+        write(&sub_path, fetch_sub_config(url)?)?;
     }
     config.reload_mihomo(&name)?;
     if set_default {
@@ -317,14 +320,13 @@ fn update_subs(names: Vec<String>, update_all: bool) -> Result<()> {
     };
     let need_reload = update_all || names.is_empty() || names.contains(&&config.current_sub);
 
-    let client = Client::new();
     names
         .into_par_iter()
         .map(|name| {
             ensure!(config.subs.contains_key(name), "subscription \"{name}\" does not exist");
             let sub_path = get_sub_path(name, false);
             let url = &config.subs[name];
-            let sub_content = subscribe(url, &client)
+            let sub_content = fetch_sub_config(url)
                 .with_context(|| format!("cannot update subscription {name}"))?;
             write(&sub_path, sub_content)?;
             Ok::<(), anyhow::Error>(())
@@ -440,7 +442,7 @@ fn main() -> Result<()> {
     if let Some(command) = cli.command {
         match command {
             Command::Sub { name, url, switch, default } => add_sub(name, url, switch, default),
-            Command::Remove { name, remove_override } => remove_sub(&name, remove_override),
+            Command::Remove { name, remove_override } => remove_sub(name, remove_override),
             Command::Switch { name, update, default } => switch_sub(name, update, default),
             Command::Update { names, all } => update_subs(names, all),
             Command::Edit { name, editor } => edit_override(name, editor),
