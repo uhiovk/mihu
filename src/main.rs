@@ -18,6 +18,7 @@ static CLIENT: LazyLock<Client> = LazyLock::new(Client::new);
 struct MihuConfig {
     mihomo_path: PathBuf,
     external_control_url: String,
+    dashboard_url: String,
     current_sub: String,
     default_sub: String,
     subs: BTreeMap<String, String>,
@@ -84,6 +85,7 @@ impl Default for MihuConfig {
         Self {
             mihomo_path: dirs::config_dir().unwrap().join("mihomo/config.yaml"),
             external_control_url: "http://127.0.0.1:9090/".into(),
+            dashboard_url: "https://board.zash.run.place/".into(),
             default_sub: String::new(),
             current_sub: String::new(),
             subs: BTreeMap::new(),
@@ -215,6 +217,12 @@ pub enum Command {
         #[arg(short, long)]
         editor: Option<String>,
     },
+    /// Open web dashboard in browser
+    Dash {
+        /// Edit address
+        #[arg(short, long)]
+        edit: Option<String>,
+    },
     /// Print information about current configuration
     Info {
         /// Print detailed information
@@ -233,8 +241,11 @@ pub enum Command {
         #[arg(short = 'c', long = "config")]
         mihomo_config: Option<PathBuf>,
         /// Mihomo's external control endpoint URL
-        #[arg(short = 'u', long = "url")]
+        #[arg(short = 'e', long = "extctl")]
         extctl_url: Option<String>,
+        /// Dashboard URL
+        #[arg(short = 'd', long = "dash")]
+        dashboard_url: Option<String>,
     },
 }
 
@@ -371,6 +382,17 @@ fn edit_override(name: Option<String>, editor: Option<String>) -> Result<()> {
     Ok(())
 }
 
+fn dashboard(edit: Option<String>) -> Result<()> {
+    let mut config = MihuConfig::load()?;
+    if let Some(url) = edit {
+        ensure!(Url::parse(&url).is_ok(), "invalid URL");
+        config.dashboard_url = url;
+        config.save()
+    } else {
+        webbrowser::open(&config.dashboard_url).context("cannot open browser")
+    }
+}
+
 fn print_info(verbose: bool, raw: bool, mihomo: bool) -> Result<()> {
     if raw {
         println!("{}", read_to_string(dirs::config_dir().unwrap().join("mihu/config.yaml"))?);
@@ -387,6 +409,7 @@ fn print_info(verbose: bool, raw: bool, mihomo: bool) -> Result<()> {
     if verbose {
         println!("Mihomo config file: {}", config.mihomo_path.display());
         println!("Mihomo external control endpoint: {}", config.external_control_url);
+        println!("Dashboard website: {}", config.dashboard_url);
     }
 
     println!("Current subscription: {}", config.current_sub);
@@ -404,7 +427,11 @@ fn print_info(verbose: bool, raw: bool, mihomo: bool) -> Result<()> {
     Ok(())
 }
 
-fn init_app(mihomo_path: Option<PathBuf>, extctl_url: Option<String>) -> Result<()> {
+fn init_app(
+    mihomo_path: Option<PathBuf>,
+    extctl_url: Option<String>,
+    dashboard_url: Option<String>,
+) -> Result<()> {
     let config_dir = dirs::config_dir().unwrap().join("mihu");
     if !config_dir.exists() {
         create_dir_all(&config_dir)?;
@@ -425,7 +452,12 @@ fn init_app(mihomo_path: Option<PathBuf>, extctl_url: Option<String>) -> Result<
             config.mihomo_path = absolute(path)?;
         }
         if let Some(url) = extctl_url {
+            ensure!(Url::parse(&url).is_ok(), "invalid URL");
             config.external_control_url = format!("{}/", url.trim_end_matches('/'));
+        }
+        if let Some(url) = dashboard_url {
+            ensure!(Url::parse(&url).is_ok(), "invalid URL");
+            config.dashboard_url = url;
         }
         config.save()?;
     }
@@ -446,8 +478,11 @@ fn main() -> Result<()> {
             Command::Switch { name, update, default } => switch_sub(name, update, default),
             Command::Update { names, all } => update_subs(names, all),
             Command::Edit { name, editor } => edit_override(name, editor),
+            Command::Dash { edit } => dashboard(edit),
             Command::Info { verbose, raw, mihomo } => print_info(verbose, raw, mihomo),
-            Command::Init { mihomo_config, extctl_url } => init_app(mihomo_config, extctl_url),
+            Command::Init { mihomo_config, extctl_url, dashboard_url } => {
+                init_app(mihomo_config, extctl_url, dashboard_url)
+            }
         }
     } else {
         update_subs(Vec::new(), false)
